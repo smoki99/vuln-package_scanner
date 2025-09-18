@@ -155,6 +155,141 @@ function stripHTML(str) {
   return str.replace(/<[^>]+>/g, '').replace(/&amp;/g, "&").replace(/&#39;/g, "'").replace(/&quot;/g, '"');
 }
 
+// Helper function to handle semver range checks
+function satisfiesRange(versionRange, version) {
+  // If the range is exact, only check equality
+  if (!isRange(versionRange)) {
+    return versionRange === version;
+  }
+  
+  try {
+    // Parse version and range into components
+    const parsedVersion = parseVersion(version);
+    
+    // Handle different range formats
+    if (versionRange.startsWith('~')) {
+      // Tilde ranges (~1.2.3) allow patch-level changes
+      const baseVersion = versionRange.substring(1);
+      const parsedBase = parseVersion(baseVersion);
+      
+      // Match major and minor version, allow patch version >= baseVersion.patch
+      return parsedVersion.major === parsedBase.major && 
+             parsedVersion.minor === parsedBase.minor && 
+             parsedVersion.patch >= parsedBase.patch;
+    } 
+    else if (versionRange.startsWith('^')) {
+      // Caret ranges (^1.2.3) allow changes that don't modify the major version
+      const baseVersion = versionRange.substring(1);
+      const parsedBase = parseVersion(baseVersion);
+      
+      if (parsedBase.major === 0) {
+        // For 0.y.z versions, ^ is more like ~
+        return parsedVersion.major === 0 && 
+               parsedVersion.minor === parsedBase.minor && 
+               parsedVersion.patch >= parsedBase.patch;
+      } else {
+        // For x.y.z where x > 0, allow anything with same major version
+        return parsedVersion.major === parsedBase.major && 
+               (parsedVersion.minor > parsedBase.minor || 
+                (parsedVersion.minor === parsedBase.minor && parsedVersion.patch >= parsedBase.patch));
+      }
+    }
+    else if (versionRange.endsWith('.x') || versionRange.endsWith('.*')) {
+      // Handle 1.2.x or 1.2.* format
+      const parts = versionRange.replace(/\.x|\.\*/g, '').split('.').map(Number);
+      
+      if (parts.length === 1) {
+        // Format 1.x - match major version
+        return parsedVersion.major === parts[0];
+      } else if (parts.length === 2) {
+        // Format 1.2.x - match major and minor versions
+        return parsedVersion.major === parts[0] && parsedVersion.minor === parts[1];
+      }
+    }
+    else if (versionRange.includes(' - ')) {
+      // Handle range format (1.2.3 - 2.3.4)
+      const [min, max] = versionRange.split(' - ').map(parseVersion);
+      
+      // Check if version is within range (inclusive)
+      return isVersionGreaterOrEqual(parsedVersion, min) && isVersionLessOrEqual(parsedVersion, max);
+    }
+    else if (versionRange.includes('>=') || versionRange.includes('<=') || 
+             versionRange.includes('>') || versionRange.includes('<')) {
+      // Handle complex ranges like ">=1.0.0 <2.0.0"
+      const conditions = versionRange.split(/\s+/);
+      
+      for (const condition of conditions) {
+        if (condition.startsWith('>=')) {
+          const minVersion = parseVersion(condition.substring(2));
+          if (!isVersionGreaterOrEqual(parsedVersion, minVersion)) return false;
+        }
+        else if (condition.startsWith('>')) {
+          const minVersion = parseVersion(condition.substring(1));
+          if (!isVersionGreater(parsedVersion, minVersion)) return false;
+        }
+        else if (condition.startsWith('<=')) {
+          const maxVersion = parseVersion(condition.substring(2));
+          if (!isVersionLessOrEqual(parsedVersion, maxVersion)) return false;
+        }
+        else if (condition.startsWith('<')) {
+          const maxVersion = parseVersion(condition.substring(1));
+          if (!isVersionLess(parsedVersion, maxVersion)) return false;
+        }
+      }
+      return true; // All conditions passed
+    }
+  } catch (e) {
+    // If there's any error in parsing, fall back to a simple check
+    console.warn(`Error parsing version range "${versionRange}": ${e.message}`);
+  }
+  
+  // Fallback to simple string inclusion check
+  return versionRange.includes(version);
+}
+
+// Helper to check if a version string is a range
+function isRange(version) {
+  return /[\^~><=.*xX]/.test(version) || version.includes(' - ');
+}
+
+// Parse a version string into components
+function parseVersion(version) {
+  // Handle version strings with prerelease or build metadata
+  const mainVersion = version.split(/[-+]/)[0];
+  const parts = mainVersion.split('.').map(p => parseInt(p, 10));
+  
+  return {
+    major: parts[0] || 0,
+    minor: parts[1] || 0,
+    patch: parts[2] || 0
+  };
+}
+
+// Version comparison helpers
+function isVersionGreaterOrEqual(v1, v2) {
+  return v1.major > v2.major || 
+         (v1.major === v2.major && v1.minor > v2.minor) || 
+         (v1.major === v2.major && v1.minor === v2.minor && v1.patch >= v2.patch);
+}
+
+function isVersionGreater(v1, v2) {
+  return v1.major > v2.major || 
+         (v1.major === v2.major && v1.minor > v2.minor) || 
+         (v1.major === v2.major && v1.minor === v2.minor && v1.patch > v2.patch);
+}
+
+function isVersionLessOrEqual(v1, v2) {
+  return v1.major < v2.major || 
+         (v1.major === v2.major && v1.minor < v2.minor) || 
+         (v1.major === v2.major && v1.minor === v2.minor && v1.patch <= v2.patch);
+}
+
+function isVersionLess(v1, v2) {
+  return v1.major < v2.major || 
+         (v1.major === v2.major && v1.minor < v2.minor) || 
+         (v1.major === v2.major && v1.minor === v2.minor && v1.patch < v2.patch);
+}
+
 // 4. Fetch and parse all advisories
 async function fetchCompromisedPackages() {
   let masterList = {};
@@ -215,15 +350,24 @@ function scanPackageJSON(pkgData, compromised) {
   ];
   for (const section of sections) {
     if (pkgData[section]) {
-      for (const [pkg, version] of Object.entries(pkgData[section])) {
+      for (const [pkg, versionRange] of Object.entries(pkgData[section])) {
         // Check if package name is in the compromised list
         if (compromised[pkg]) {
           // Check if any of the compromised versions match
           for (const compVersion of compromised[pkg]) {
-            // Simple version check - if the version string contains the compromised version
-            // or if the version is exactly equal to the compromised version
-            if (version === compVersion || version.includes(compVersion)) {
-              findings.push({ pkg, version, section });
+            // First, check for exact match
+            if (versionRange === compVersion) {
+              findings.push({ pkg, version: versionRange, section });
+              break;
+            }
+            
+            // Next, check if the range could include the compromised version
+            if (satisfiesRange(versionRange, compVersion)) {
+              findings.push({ 
+                pkg, 
+                version: `${versionRange} (matches ${compVersion})`, 
+                section 
+              });
               break;
             }
           }
@@ -244,9 +388,19 @@ function scanPackageLock(pkgLockData, compromised) {
       if (compromised[pkg]) {
         // Check if any of the compromised versions match
         for (const compVersion of compromised[pkg]) {
-          // Check for exact match or if version contains the compromised version
-          if (meta.version === compVersion || meta.version.includes(compVersion)) {
+          // Check for exact match
+          if (meta.version === compVersion) {
             findings.push({ pkg, version: meta.version, section: "package-lock" });
+            break;
+          }
+          
+          // Next, check if the version could include the compromised version
+          if (satisfiesRange(meta.version, compVersion)) {
+            findings.push({ 
+              pkg, 
+              version: `${meta.version} (matches ${compVersion})`, 
+              section: "package-lock" 
+            });
             break;
           }
         }
