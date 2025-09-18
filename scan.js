@@ -18,7 +18,8 @@ const ADVISORY_SOURCES = [
   // Wiz advisory
   { url: "https://www.wiz.io/blog/shai-hulud-npm-supply-chain-attack", type: "wiz" },
   // StepSecurity advisory
-  { url: "https://www.stepsecurity.io/blog/ctrl-tinycolor-and-40-npm-packages-compromised", type: "stepsecurity" }
+  { url: "https://www.stepsecurity.io/blog/ctrl-tinycolor-and-40-npm-packages-compromised", type: "stepsecurity" },
+  // Additional sources can be added here if needed
 ];
 
 // 2. Helper: fetch URL as text (promise)
@@ -134,6 +135,68 @@ function parseWiz(html) {
   return packages;
 }
 
+function parseGitHubAdvisory(html) {
+  // Parse GitHub Advisory format
+  let packages = {};
+  
+  try {
+    // Look for the affected package name
+    const titleMatch = html.match(/<h1[^>]*>([^<]+)<\/h1>/);
+    let packageName = '';
+    
+    if (titleMatch) {
+      const title = stripHTML(titleMatch[1]).trim();
+      // Format is often "Malicious code in X package" or similar
+      const pkgMatch = title.match(/(?:in|of|from|with)\s+(@?[a-zA-Z0-9_.\-]+(?:\/[a-zA-Z0-9_.\-]+)?)/i);
+      if (pkgMatch) {
+        packageName = pkgMatch[1];
+      }
+    }
+    
+    // If we couldn't find the package name in the title, try looking for it elsewhere
+    if (!packageName) {
+      const packageMatch = html.match(/Package Name[:\s]+<[^>]+>([^<]+)<\/[^>]+>/i);
+      if (packageMatch) {
+        packageName = stripHTML(packageMatch[1]).trim();
+      }
+    }
+    
+    // Look for affected versions
+    if (packageName) {
+      const versionSections = [
+        // Look for affected versions section
+        html.match(/Affected Versions[:\s]+<[^>]+>([\s\S]+?)<\/(?:div|span|p)>/i),
+        // Look for vulnerable versions section
+        html.match(/Vulnerable Versions[:\s]+<[^>]+>([\s\S]+?)<\/(?:div|span|p)>/i),
+        // Look for version information in CVE details
+        html.match(/CVE-\d+-\d+[^<]*<[^>]+>([\s\S]+?)<\/(?:div|span|p)>/i)
+      ].filter(Boolean);
+      
+      let versions = new Set();
+      
+      for (const section of versionSections) {
+        if (section) {
+          const versionText = stripHTML(section[1]);
+          const versionMatches = versionText.match(/\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.]+)?/g);
+          if (versionMatches) {
+            for (const v of versionMatches) {
+              versions.add(v);
+            }
+          }
+        }
+      }
+      
+      if (versions.size > 0) {
+        packages[packageName] = versions;
+      }
+    }
+  } catch (e) {
+    console.warn(`Error parsing GitHub advisory: ${e.message}`);
+  }
+  
+  return packages;
+}
+
 function parseGeneric(html) {
   // Generic parser that looks for package@version patterns in text
   let packages = {};
@@ -148,6 +211,51 @@ function parseGeneric(html) {
       packages[pkg].add(version);
     }
   }
+  
+  // Also try to find packages listed in tables with version information
+  try {
+    const tableRe = /<table[^>]*>(.*?)<\/table>/gs;
+    let tableMatch;
+    while ((tableMatch = tableRe.exec(html)) !== null) {
+      const tableContent = tableMatch[1];
+      const rowRe = /<tr[^>]*>(.*?)<\/tr>/gs;
+      let rowMatch;
+      
+      while ((rowMatch = rowRe.exec(tableContent)) !== null) {
+        const row = rowMatch[1];
+        const cellRe = /<t[dh][^>]*>(.*?)<\/t[dh]>/gi;
+        const cells = [];
+        
+        let cellMatch;
+        while ((cellMatch = cellRe.exec(row)) !== null) {
+          cells.push(stripHTML(cellMatch[1]).trim());
+        }
+        
+        if (cells.length >= 2) {
+          // Common table formats have package name in first column and version in another
+          const potentialPackage = cells[0];
+          const packageMatch = potentialPackage.match(/^(@?[a-zA-Z0-9_.\-]+(?:\/[a-zA-Z0-9_.\-]+)?)$/);
+          
+          if (packageMatch) {
+            const pkg = packageMatch[1];
+            // Check other cells for version numbers
+            for (let i = 1; i < cells.length; i++) {
+              const versionMatches = cells[i].match(/\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.]+)?/g);
+              if (versionMatches) {
+                if (!packages[pkg]) packages[pkg] = new Set();
+                for (const version of versionMatches) {
+                  packages[pkg].add(version);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.warn(`Error parsing tables: ${e.message}`);
+  }
+  
   return packages;
 }
 
@@ -295,40 +403,57 @@ async function fetchCompromisedPackages() {
   let masterList = {};
   let failedSources = 0;
   let successfulSources = 0;
+  let pendingRequests = [];
   
+  // Start all requests in parallel
   for (const src of ADVISORY_SOURCES) {
-    console.log(`Fetching from ${src.url}...`);
-    let html;
-    try { 
-      html = await fetchURL(src.url); 
-      successfulSources++;
-    } catch (e) {
-      console.error(`Failed to fetch ${src.url}: ${e.message}`);
-      failedSources++;
-      continue;
-    }
-    
-    let result = {};
-    
-    try {
-      // Select parser based on source type
-      if (src.type === 'stepsecurity') result = parseStepSecurity(html);
-      else if (src.type === 'ox') result = parseOX(html);
-      else if (src.type === 'wiz') result = parseWiz(html);
-      else if (src.type === 'generic') result = parseGeneric(html);
-      else {
-        console.warn(`Unknown source type: ${src.type}, trying generic parser`);
-        result = parseGeneric(html);
-      }
-      
-      console.log(`Found ${Object.keys(result).length} packages from ${src.url}`);
-      
-      for (const [pkg, versSet] of Object.entries(result)) {
+    pendingRequests.push(
+      (async () => {
+        console.log(`Fetching from ${src.url}...`);
+        try { 
+          const html = await fetchURL(src.url); 
+          successfulSources++;
+          
+          let result = {};
+          
+          try {
+            // Select parser based on source type
+            if (src.type === 'stepsecurity') result = parseStepSecurity(html);
+            else if (src.type === 'ox') result = parseOX(html);
+            else if (src.type === 'wiz') result = parseWiz(html);
+            else if (src.type === 'github') result = parseGitHubAdvisory(html);
+            else if (src.type === 'generic') result = parseGeneric(html);
+            else {
+              console.warn(`Unknown source type: ${src.type}, trying generic parser`);
+              result = parseGeneric(html);
+            }
+            
+            console.log(`Found ${Object.keys(result).length} packages from ${src.url}`);
+            
+            return result;
+          } catch (e) {
+            console.error(`Error parsing data from ${src.url}: ${e.message}`);
+            return {};
+          }
+        } catch (e) {
+          console.error(`Failed to fetch ${src.url}: ${e.message}`);
+          failedSources++;
+          return {};
+        }
+      })()
+    );
+  }
+  
+  // Wait for all requests to complete
+  const results = await Promise.allSettled(pendingRequests);
+  
+  // Merge all results
+  for (const result of results) {
+    if (result.status === 'fulfilled' && result.value) {
+      for (const [pkg, versSet] of Object.entries(result.value)) {
         if (!(pkg in masterList)) masterList[pkg] = new Set();
         for (const v of versSet) masterList[pkg].add(v);
       }
-    } catch (e) {
-      console.error(`Error parsing data from ${src.url}: ${e.message}`);
     }
   }
   
