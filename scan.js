@@ -15,10 +15,6 @@ const ADVISORY_SOURCES = [
   { url: "https://jfrog.com/blog/shai-hulud-npm-supply-chain-attack-new-compromised-packages-detected/", type: "generic" },
   // Semgrep advisory
   { url: "https://semgrep.dev/blog/2025/security-advisory-npm-packages-using-secret-scanning-tools-to-steal-credentials/", type: "generic" },
-  // Socket advisory
-  { url: "https://socket.dev/blog/tinycolor-supply-chain-attack-affects-40-packages", type: "generic" },
-  // OX Security advisory
-  { url: "https://www.ox.security/blog/npm-2-0-hack-40-npm-packages-hit-in-major-supply-chain-attack/", type: "ox" },
   // Wiz advisory
   { url: "https://www.wiz.io/blog/shai-hulud-npm-supply-chain-attack", type: "wiz" },
   // StepSecurity advisory
@@ -26,13 +22,39 @@ const ADVISORY_SOURCES = [
 ];
 
 // 2. Helper: fetch URL as text (promise)
-function fetchURL(url) {
+function fetchURL(url, timeout = 15000) {
+  // For testing, use a shorter timeout if environment variable is set
+  if (process.env.WORM_SCANNER_TEST) {
+    timeout = 5000;
+  }
+  
   return new Promise((resolve, reject) => {
-    const req = https.get(new URL(url), (res) => {
+    const req = https.get(new URL(url), { timeout: timeout }, (res) => {
+      // Check for error status codes
+      if (res.statusCode >= 400) {
+        reject(new Error(`HTTP Error: ${res.statusCode} ${res.statusMessage}`));
+        return;
+      }
+      
       let data = '';
       res.on('data', chunk => data += chunk);
-      res.on('end', () => resolve(data));
+      
+      // Set a timeout for the response reading as well
+      const responseTimeout = setTimeout(() => {
+        reject(new Error(`Response reading timeout after ${timeout}ms`));
+      }, timeout);
+      
+      res.on('end', () => {
+        clearTimeout(responseTimeout);
+        resolve(data);
+      });
     });
+    
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error(`Request timeout after ${timeout}ms`));
+    });
+    
     req.on('error', reject);
   });
 }
@@ -136,36 +158,51 @@ function stripHTML(str) {
 // 4. Fetch and parse all advisories
 async function fetchCompromisedPackages() {
   let masterList = {};
+  let failedSources = 0;
+  let successfulSources = 0;
+  
   for (const src of ADVISORY_SOURCES) {
     console.log(`Fetching from ${src.url}...`);
     let html;
-    try { html = await fetchURL(src.url); }
-    catch (e) {
-      console.error(`Failed to fetch ${src.url}: ${e}`);
+    try { 
+      html = await fetchURL(src.url); 
+      successfulSources++;
+    } catch (e) {
+      console.error(`Failed to fetch ${src.url}: ${e.message}`);
+      failedSources++;
       continue;
     }
+    
     let result = {};
     
-    // Select parser based on source type
-    if (src.type === 'stepsecurity') result = parseStepSecurity(html);
-    else if (src.type === 'ox') result = parseOX(html);
-    else if (src.type === 'wiz') result = parseWiz(html);
-    else if (src.type === 'generic') result = parseGeneric(html);
-    else {
-      console.warn(`Unknown source type: ${src.type}, trying generic parser`);
-      result = parseGeneric(html);
-    }
-    
-    console.log(`Found ${Object.keys(result).length} packages from ${src.url}`);
-    
-    for (const [pkg, versSet] of Object.entries(result)) {
-      if (!(pkg in masterList)) masterList[pkg] = new Set();
-      for (const v of versSet) masterList[pkg].add(v);
+    try {
+      // Select parser based on source type
+      if (src.type === 'stepsecurity') result = parseStepSecurity(html);
+      else if (src.type === 'ox') result = parseOX(html);
+      else if (src.type === 'wiz') result = parseWiz(html);
+      else if (src.type === 'generic') result = parseGeneric(html);
+      else {
+        console.warn(`Unknown source type: ${src.type}, trying generic parser`);
+        result = parseGeneric(html);
+      }
+      
+      console.log(`Found ${Object.keys(result).length} packages from ${src.url}`);
+      
+      for (const [pkg, versSet] of Object.entries(result)) {
+        if (!(pkg in masterList)) masterList[pkg] = new Set();
+        for (const v of versSet) masterList[pkg].add(v);
+      }
+    } catch (e) {
+      console.error(`Error parsing data from ${src.url}: ${e.message}`);
     }
   }
+  
   // Convert all sets to arrays for easier later use
   for (const k in masterList) masterList[k] = Array.from(masterList[k]);
+  
+  console.log(`Advisory sources: ${successfulSources} succeeded, ${failedSources} failed`);
   console.log(`Total unique packages found: ${Object.keys(masterList).length}`);
+  
   return masterList;
 }
 
@@ -179,8 +216,17 @@ function scanPackageJSON(pkgData, compromised) {
   for (const section of sections) {
     if (pkgData[section]) {
       for (const [pkg, version] of Object.entries(pkgData[section])) {
-        if (compromised[pkg] && compromised[pkg].some(v => version.includes(v))) {
-          findings.push({ pkg, version, section });
+        // Check if package name is in the compromised list
+        if (compromised[pkg]) {
+          // Check if any of the compromised versions match
+          for (const compVersion of compromised[pkg]) {
+            // Simple version check - if the version string contains the compromised version
+            // or if the version is exactly equal to the compromised version
+            if (version === compVersion || version.includes(compVersion)) {
+              findings.push({ pkg, version, section });
+              break;
+            }
+          }
         }
       }
     }
@@ -193,9 +239,19 @@ function scanPackageLock(pkgLockData, compromised) {
   if (pkgLockData.dependencies) {
     for (const [pkg, meta] of Object.entries(pkgLockData.dependencies)) {
       if (!meta.version) continue;
-      if (compromised[pkg] && compromised[pkg].includes(meta.version)) {
-        findings.push({ pkg, version: meta.version, section: "package-lock" });
+      
+      // Check if package name is in the compromised list
+      if (compromised[pkg]) {
+        // Check if any of the compromised versions match
+        for (const compVersion of compromised[pkg]) {
+          // Check for exact match or if version contains the compromised version
+          if (meta.version === compVersion || meta.version.includes(compVersion)) {
+            findings.push({ pkg, version: meta.version, section: "package-lock" });
+            break;
+          }
+        }
       }
+      
       // Recursively check nested dependencies
       if (meta.dependencies) {
         findings.push(...scanPackageLock({ dependencies: meta.dependencies }, compromised));
@@ -238,12 +294,12 @@ function scanPackageLock(pkgLockData, compromised) {
 
   // Report
   if (findings.length) {
-    console.log("Detected compromised packages:");
+    console.log("\n🚨 Detected compromised packages:");
     for (const f of findings) {
       console.log(`- ${f.pkg}@${f.version} (${f.section})`);
     }
   } else {
-    console.log("No compromised packages detected in your project.");
+    console.log("\n✅ No compromised packages detected in your project.");
   }
   
   // Print summary of compromised packages database
