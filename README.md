@@ -12,6 +12,7 @@ The Shai-Hulud attack is a sophisticated npm supply-chain attack that compromise
 - **Multiple Advisory Sources**: Fetches data from several security advisories
 - **Semver Range Detection**: Detects vulnerable packages even when using version ranges (`~1.2.0`, `^1.2.0`, etc.)
 - **Package Lock Support**: Scans both package.json and package-lock.json, including nested dependencies
+- **Recursive Directory Scanning**: Optionally scans subdirectories for monorepos and workspace projects
 - **Offline Scanning**: Once data is fetched, scanning can be done offline
 - **Fast & Efficient**: Parallel requests to advisory sources with proper error handling
 
@@ -23,11 +24,23 @@ Simply copy the `scan.js` file to your project directory and run it:
 node scan.js
 ```
 
-That's it! The scanner will:
+For monorepos or workspace projects, use the `--recursive` flag to scan subdirectories:
 
-1. Fetch compromised package data from security advisories
-2. Check your project's package.json and package-lock.json files
-3. Report any compromised packages found
+```bash
+node scan.js --recursive
+```
+
+You can also specify a custom directory to scan:
+
+```bash
+node scan.js --dir ./path/to/project
+```
+
+Combine flags for comprehensive scanning:
+
+```bash
+node scan.js --recursive --dir ./projects
+```
 
 ## How It Works
 
@@ -43,12 +56,14 @@ The `scan.js` file is a self-contained script that:
    - Analyzes package.json for direct dependencies
    - Checks all dependency types (dependencies, devDependencies, etc.)
    - Recursively examines package-lock.json for nested dependencies
+   - For monorepos, optionally scans all nested package.json files
    - Implements proper semver range matching to detect version ranges that include compromised versions
 
 3. **Reports Findings**:
    - Displays clear output with emoji indicators
    - Shows detailed information about each detected compromised package
    - Provides a summary of the advisory database
+   - Organizes findings by project (when scanning subdirectories)
 
 ## Example Output
 

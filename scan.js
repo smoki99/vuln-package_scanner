@@ -542,6 +542,14 @@ function scanPackageLock(pkgLockData, compromised) {
 
 // 6. Main
 (async function main() {
+  // Process command line arguments
+  const args = process.argv.slice(2);
+  const isRecursive = args.includes('--recursive') || args.includes('-r');
+  const dirIndex = Math.max(args.indexOf('--dir'), args.indexOf('-d'));
+  const customDir = dirIndex >= 0 && args.length > dirIndex + 1 ? args[dirIndex + 1] : null;
+  
+  const rootDir = customDir || '.';
+
   console.log("Fetching compromised packages...");
   const compromised = await fetchCompromisedPackages();
   if (!Object.keys(compromised).length) {
@@ -549,36 +557,31 @@ function scanPackageLock(pkgLockData, compromised) {
     process.exit(0);
   }
   
-  let findings = [];
-  
-  // Try to load package.json (optional)
-  let pkgData;
-  try { 
-    pkgData = JSON.parse(fs.readFileSync('package.json', 'utf8')); 
-    console.log("Scanning package.json...");
-    findings = scanPackageJSON(pkgData, compromised);
-  } catch (e) { 
-    console.log("No package.json found in current directory."); 
-  }
+  // Track project stats
+  const stats = {
+    totalProjects: 0,
+    compromisedProjects: 0,
+    cleanProjects: 0
+  };
 
-  // Try to load package-lock.json (optional)
-  let pkgLockData = null;
-  try { 
-    pkgLockData = JSON.parse(fs.readFileSync('package-lock.json', 'utf8')); 
-    console.log("Scanning package-lock.json...");
-    findings.push(...scanPackageLock(pkgLockData, compromised));
-  } catch (e) { 
-    console.log("No package-lock.json found in current directory."); 
-  }
-
-  // Report
-  if (findings.length) {
-    console.log("\n🚨 Detected compromised packages:");
-    for (const f of findings) {
-      console.log(`- ${f.pkg}@${f.version} (${f.section})`);
+  if (isRecursive) {
+    // Scan all subdirectories with package.json files
+    await scanRecursively(rootDir, compromised, stats);
+    
+    // Print overall summary
+    console.log("\n" + "=".repeat(50));
+    console.log("SCAN SUMMARY");
+    console.log("=".repeat(50));
+    console.log(`Total projects scanned: ${stats.totalProjects}`);
+    
+    if (stats.compromisedProjects > 0) {
+      console.log(`🚨 Compromised packages found in ${stats.compromisedProjects} project(s)`);
+    } else {
+      console.log(`✅ No compromised packages found in ${stats.totalProjects} project(s)`);
     }
   } else {
-    console.log("\n✅ No compromised packages detected in your project.");
+    // Only scan the specified directory
+    await scanDirectory(rootDir, compromised, stats);
   }
   
   // Print summary of compromised packages database
@@ -593,4 +596,168 @@ function scanPackageLock(pkgLockData, compromised) {
       console.log(`  * ${pkg} (${versions.length} versions)`);
     }
   }
+  
+  // Exit with appropriate code
+  process.exit(stats.compromisedProjects > 0 ? 1 : 0);
 })();
+
+// Helper function to scan recursively
+async function scanRecursively(rootDir, compromised, stats) {
+  try {
+    // Get all directories with package.json files
+    const projectDirs = findAllProjectDirs(rootDir);
+    
+    // Scan each project directory
+    for (const dir of projectDirs) {
+      await scanDirectory(dir, compromised, stats);
+    }
+  } catch (e) {
+    console.error(`Error scanning recursively: ${e.message}`);
+  }
+}
+
+// Helper function to scan a single directory
+async function scanDirectory(dir, compromised, stats) {
+  console.log(`\nScanning directory: ${dir}`);
+  stats.totalProjects++;
+  
+  let findings = [];
+  let projectName = "Unknown Project";
+  
+  // Try to load package.json
+  let pkgData;
+  try { 
+    const pkgPath = path.join(dir, 'package.json');
+    pkgData = JSON.parse(fs.readFileSync(pkgPath, 'utf8')); 
+    projectName = pkgData.name || path.basename(dir);
+    console.log(`  Scanning package.json...`);
+    findings = scanPackageJSON(pkgData, compromised);
+  } catch (e) { 
+    console.log(`  No package.json found in ${dir}`); 
+  }
+
+  // Try to load package-lock.json
+  let pkgLockData = null;
+  try { 
+    const lockPath = path.join(dir, 'package-lock.json');
+    pkgLockData = JSON.parse(fs.readFileSync(lockPath, 'utf8')); 
+    console.log(`  Scanning package-lock.json...`);
+    findings.push(...scanPackageLock(pkgLockData, compromised));
+  } catch (e) { 
+    // Try npm v7+ format with "packages" field
+    try {
+      const lockPath = path.join(dir, 'package-lock.json');
+      pkgLockData = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+      if (pkgLockData.packages) {
+        console.log(`  Scanning package-lock.json (npm v7+ format)...`);
+        findings.push(...scanPackageLockV7(pkgLockData, compromised));
+      }
+    } catch (e2) {
+      console.log(`  No package-lock.json found in ${dir}`);
+    }
+  }
+
+  // Also check for pnpm-lock.yaml and yarn.lock (basic support)
+  try {
+    if (fs.existsSync(path.join(dir, 'pnpm-lock.yaml'))) {
+      console.log(`  Found pnpm-lock.yaml (Note: basic support only)`);
+      // Basic message for now - detailed pnpm support could be added later
+    }
+  } catch (e) { /* ignore */ }
+  
+  try {
+    if (fs.existsSync(path.join(dir, 'yarn.lock'))) {
+      console.log(`  Found yarn.lock (Note: basic support only)`);
+      // Basic message for now - detailed yarn support could be added later
+    }
+  } catch (e) { /* ignore */ }
+
+  // Report findings for this directory
+  if (findings.length) {
+    console.log(`  🚨 Detected compromised packages in ${projectName}:`);
+    for (const f of findings) {
+      console.log(`  - ${f.pkg}@${f.version} [${f.section}]`);
+    }
+    stats.compromisedProjects++;
+  } else {
+    console.log(`  ✅ No compromised packages detected in ${projectName}`);
+    stats.cleanProjects++;
+  }
+  
+  return findings;
+}
+
+// Scan npm v7+ package-lock.json format
+function scanPackageLockV7(pkgLockData, compromised) {
+  const findings = [];
+  
+  // npm v7+ uses a "packages" field for all dependencies
+  if (pkgLockData.packages) {
+    for (const [pkgPath, meta] of Object.entries(pkgLockData.packages)) {
+      // Skip the root package
+      if (pkgPath === '') continue;
+      
+      // Extract package name from path
+      // Format is typically "node_modules/pkg" or "node_modules/pkg/node_modules/nested-pkg"
+      const pathParts = pkgPath.split('/');
+      const pkgNameIndex = pathParts.findIndex((part, idx) => idx > 0 && pathParts[idx-1] === 'node_modules');
+      
+      if (pkgNameIndex === -1 || !meta.version) continue;
+      
+      const pkg = pathParts[pkgNameIndex];
+      
+      // Check if package name is in the compromised list
+      if (compromised[pkg]) {
+        // Check if any of the compromised versions match
+        for (const compVersion of compromised[pkg]) {
+          // Check for exact match
+          if (meta.version === compVersion) {
+            findings.push({ pkg, version: meta.version, section: "package-lock-v7" });
+            break;
+          }
+          
+          // Next, check if the version could include the compromised version
+          if (satisfiesRange(meta.version, compVersion)) {
+            findings.push({ 
+              pkg, 
+              version: `${meta.version} (matches ${compVersion})`, 
+              section: "package-lock-v7" 
+            });
+            break;
+          }
+        }
+      }
+    }
+  }
+  
+  return findings;
+}
+
+// Find all directories containing package.json files
+function findAllProjectDirs(rootDir) {
+  const results = [];
+  
+  function traverseDir(dir) {
+    const items = fs.readdirSync(dir, { withFileTypes: true });
+    
+    // Check if this directory has a package.json
+    if (items.some(item => item.isFile() && item.name === 'package.json')) {
+      results.push(dir);
+    }
+    
+    // Traverse subdirectories, skipping node_modules
+    for (const item of items) {
+      if (item.isDirectory() && item.name !== 'node_modules' && !item.name.startsWith('.')) {
+        traverseDir(path.join(dir, item.name));
+      }
+    }
+  }
+  
+  try {
+    traverseDir(rootDir);
+  } catch (e) {
+    console.error(`Error traversing directories: ${e.message}`);
+  }
+  
+  return results;
+}
